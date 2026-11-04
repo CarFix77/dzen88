@@ -1,17 +1,18 @@
-# main.py — полная версия со всеми функциями
+# main.py — финальная версия: фото из источника + Pexels, без Дзена
 import os, json, logging, random, re
 import feedparser
 import requests
 from bs4 import BeautifulSoup
-from urllib.parse import quote
 
 logging.basicConfig(level=logging.INFO)
 
 # ================= НАСТРОЙКИ =================
 BOT_TOKEN = "9172067181:AAHRPly5-XRdX3ccc7CMSodoek7_RygjuxQ"
 ADMIN_ID = 1470714545
+PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 
-MAX_POSTS_PER_RUN = 8   # сколько максимум постов присылать за один запуск
+MAX_POSTS_PER_RUN = 15        # сколько постов пытаемся отправить
+MIN_POSTS_TARGET = 10         # минимум, который нужен
 
 RSS_FEEDS = [
     "https://ria.ru/export/rss2/index.xml",
@@ -47,7 +48,7 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # =============================================
 
 
-# ---------- БАЗА «УЖЕ ОТПРАВЛЕНО» ----------
+# ---------- ХРАНИЛИЩЕ «УЖЕ ОТПРАВЛЕНО» ----------
 def load_seen():
     if os.path.exists(SEEN_FILE):
         try:
@@ -60,19 +61,25 @@ def load_seen():
 
 def save_seen(seen):
     with open(SEEN_FILE, "w") as f:
-        json.dump(list(seen)[-3000:], f, ensure_ascii=False, indent=2)
+        json.dump(list(seen)[-5000:], f, ensure_ascii=False, indent=2)
 
 
-# ---------- ПЕРЕПИСЫВАНИЕ ТЕКСТА ----------
-def rewrite_with_pollinations(text: str):
+# ---------- ПЕРЕПИСЫВАНИЕ + КЛЮЧЕВЫЕ СЛОВА ----------
+def rewrite_article(text: str):
+    """Возвращает (заголовок, тело, ключевые_слова_для_фото)."""
     if not text or len(text) < 40:
-        return None, None
+        return None, None, None
 
     prompt = (
         "Ты — редактор новостного канала. Перепиши новость своими словами.\n"
         "- Первое предложение — цепляющий заголовок до 120 символов.\n"
         "- Затем 3–5 коротких абзацев, живой язык, без канцелярита.\n"
         "- Не выдумывай факты.\n\n"
+        "В САМОМ КОНЦЕ ответа добавь отдельную строку строго в формате:\n"
+        "KEYWORDS: word1, word2, word3\n"
+        "(3–5 АНГЛИЙСКИХ слов, описывающих визуальный образ новости. "
+        "Примеры: 'oil refinery, pipeline, gas'; 'bank building, money, finance'; "
+        "'military, tanks, war'; 'president, government, parliament').\n\n"
         f"Новость: {text[:3000]}"
     )
 
@@ -88,16 +95,23 @@ def rewrite_with_pollinations(text: str):
         )
         r.raise_for_status()
         full_text = r.json()["choices"][0]["message"]["content"].strip()
+
+        keywords = None
+        if "KEYWORDS:" in full_text:
+            parts = full_text.split("KEYWORDS:")
+            full_text = parts[0].strip()
+            keywords = parts[1].strip().strip("*# ")
+
         lines = full_text.split("\n", 1)
         title = lines[0].strip().strip("*# ")[:120]
         body = lines[1].strip() if len(lines) > 1 else full_text
-        return title, body
+        return title, body, keywords
     except Exception as e:
-        logging.error(f"Pollinations: {e}")
-        return None, None
+        logging.error(f"Pollinations rewrite: {e}")
+        return None, None, None
 
 
-# ---------- РАБОТА С КАРТИНКАМИ ----------
+# ---------- ФОТО УРОВЕНЬ 1: ОРИГИНАЛ ИЗ ИСТОЧНИКА ----------
 def download_image(url, prefix):
     if not url:
         return None
@@ -107,27 +121,44 @@ def download_image(url, prefix):
             ext = r.headers["Content-Type"].split("/")[-1].split(";")[0]
             if ext == "jpeg":
                 ext = "jpg"
-            path = os.path.join(TEMP_DIR, f"{prefix}.{ext}")
+            path = os.path.join(TEMP_DIR, f"{prefix}_src.{ext}")
             with open(path, "wb") as f:
                 f.write(r.content)
             return path
     except Exception as e:
-        logging.warning(f"Download image: {e}")
+        logging.warning(f"Download source image: {e}")
     return None
 
 
-def generate_image(prompt, prefix):
-    encoded = quote(prompt + ", photorealistic, news illustration")
-    url = f"https://image.pollinations.ai/prompt/{encoded}?width=1200&height=675&nologo=true&model=flux"
+# ---------- ФОТО УРОВЕНЬ 2: PEXELS ----------
+def search_pexels_image(keywords: str, prefix: str):
+    if not PEXELS_API_KEY or not keywords:
+        return None
     try:
-        r = requests.get(url, timeout=60)
-        if r.status_code == 200:
-            path = os.path.join(TEMP_DIR, f"{prefix}.jpg")
-            with open(path, "wb") as f:
-                f.write(r.content)
-            return path
+        r = requests.get(
+            "https://api.pexels.com/v1/search",
+            headers={"Authorization": PEXELS_API_KEY},
+            params={"query": keywords, "per_page": 3, "orientation": "landscape"},
+            timeout=20,
+        )
+        if r.status_code != 200:
+            logging.warning(f"Pexels HTTP {r.status_code}")
+            return None
+        photos = r.json().get("photos", [])
+        if not photos:
+            return None
+
+        # Пробуем скачать первую подходящую
+        for photo in photos:
+            img_url = photo["src"]["large"]
+            img = requests.get(img_url, timeout=20)
+            if img.status_code == 200:
+                path = os.path.join(TEMP_DIR, f"{prefix}_pexels.jpg")
+                with open(path, "wb") as f:
+                    f.write(img.content)
+                return path
     except Exception as e:
-        logging.warning(f"Generate image: {e}")
+        logging.warning(f"Pexels search: {e}")
     return None
 
 
@@ -136,23 +167,25 @@ def send_telegram(text, image_path=None):
     try:
         if image_path and os.path.exists(image_path):
             with open(image_path, "rb") as photo:
-                requests.post(
+                r = requests.post(
                     f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
                     data={"chat_id": ADMIN_ID, "caption": text[:1024]},
                     files={"photo": photo},
                     timeout=30,
                 )
         else:
-            requests.post(
+            r = requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
                 data={"chat_id": ADMIN_ID, "text": text[:4000], "parse_mode": "Markdown"},
                 timeout=30,
             )
+        return r.status_code == 200
     except Exception as e:
         logging.error(f"Telegram send: {e}")
+        return False
 
 
-# ---------- ЧТЕНИЕ RSS ----------
+# ---------- СБОР RSS ----------
 def extract_image_from_rss(entry):
     if hasattr(entry, "media_content"):
         for m in entry.media_content:
@@ -170,7 +203,7 @@ def extract_image_from_rss(entry):
 def fetch_rss(feed_url, seen, posts_batch):
     try:
         feed = feedparser.parse(feed_url)
-        for entry in feed.entries[:3]:
+        for entry in feed.entries[:5]:
             uid = entry.get("id") or entry.get("link")
             if not uid or uid in seen:
                 continue
@@ -184,36 +217,30 @@ def fetch_rss(feed_url, seen, posts_batch):
         logging.error(f"RSS {feed_url}: {e}")
 
 
-# ---------- ЧТЕНИЕ TELEGRAM ЧЕРЕЗ t.me/s/ ----------
+# ---------- СБОР TELEGRAM ----------
 def scrape_telegram_channel(channel, limit=3):
     url = f"https://t.me/s/{channel}"
     posts = []
     try:
         r = requests.get(url, timeout=20, headers={"User-Agent": "Mozilla/5.0"})
         if r.status_code != 200:
-            logging.warning(f"TG {channel}: HTTP {r.status_code}")
             return posts
-
         soup = BeautifulSoup(r.text, "html.parser")
         messages = soup.find_all("div", class_="tgme_widget_message")
-
         for msg in messages[-limit:]:
             text_div = msg.find("div", class_="tgme_widget_message_text")
             text = text_div.get_text(separator="\n", strip=True) if text_div else ""
             if len(text) < 80:
                 continue
-
             photos = []
             photo_wrap = msg.find("a", class_="tgme_widget_message_photo_wrap")
             if photo_wrap and photo_wrap.get("style"):
                 m = re.search(r"url\(['\"]?(.*?)['\"]?\)", photo_wrap["style"])
                 if m:
                     photos.append(m.group(1))
-
             date_link = msg.find("a", class_="tgme_widget_message_date")
             link = date_link.get("href") if date_link else None
             post_id = msg.get("data-post", "")
-
             posts.append({
                 "uid": link or f"{channel}_{post_id}",
                 "text": text,
@@ -233,34 +260,77 @@ def main():
     for feed_url in RSS_FEEDS:
         fetch_rss(feed_url, seen, candidates)
 
-    # 2. Telegram (перемешиваем, чтобы за неделю прошли все)
+    # 2. Telegram (перемешиваем каналы и берём побольше)
     channels = TELEGRAM_CHANNELS.copy()
     random.shuffle(channels)
-    for channel in channels:
-        candidates.extend(scrape_telegram_channel(channel, limit=2))
+    for channel in channels[:25]:      # до 25 каналов за запуск
+        candidates.extend(scrape_telegram_channel(channel, limit=3))
 
     logging.info(f"Кандидатов собрано: {len(candidates)}")
 
-    # 3. Ограничение и перемешивание
+    # Перемешиваем, чтобы источники были разные
     random.shuffle(candidates)
-    batch = candidates[:MAX_POSTS_PER_RUN]
 
-    sent = 0
-    for item in batch:
-        title, body = rewrite_with_pollinations(item["text"])
+    sent_ok = 0
+    sent_with_photo = 0
+    sent_from_source = 0
+    sent_from_pexels = 0
+    sent_text_only = 0
+
+    for item in candidates:
+        if sent_ok >= MAX_POSTS_PER_RUN:
+            break
+
+        title, body, keywords = rewrite_article(item["text"])
         if not title:
             continue
 
-        img = download_image(item["image_url"], item["uid"].replace("/", "_")[:30])
-        if not img:
-            img = generate_image(title, item["uid"].replace("/", "_")[:30])
+        img_path = None
+        photo_source = None
 
-        send_telegram(f"**{title}**\n\n{body}", img)
-        sent += 1
-        logging.info(f"Отправлено: {title[:50]}")
+        # УРОВЕНЬ 1: оригинальное фото
+        if item["image_url"]:
+            img_path = download_image(item["image_url"], item["uid"].replace("/", "_")[:30])
+            if img_path:
+                photo_source = "source"
+                sent_from_source += 1
+
+        # УРОВЕНЬ 2: Pexels по ключевым словам
+        if not img_path and keywords:
+            img_path = search_pexels_image(keywords, item["uid"].replace("/", "_")[:30])
+            if img_path:
+                photo_source = "pexels"
+                sent_from_pexels += 1
+
+        # УРОВЕНЬ 3: только текст (если ничего не нашли)
+        if not img_path:
+            sent_text_only += 1
+
+        # Отправка
+        ok = send_telegram(f"**{title}**\n\n{body}", img_path)
+        if ok:
+            sent_ok += 1
+            if img_path:
+                sent_with_photo += 1
+            logging.info(f"[{sent_ok}/{MAX_POSTS_PER_RUN}] {photo_source or 'text-only'}: {title[:50]}")
+
+        # Небольшая пауза между отправками, чтобы Telegram не ругался
+        import time
+        time.sleep(1)
 
     save_seen(seen)
-    logging.info(f"Готово. Отправлено постов: {sent}")
+
+    logging.info(
+        f"=== ИТОГО ===\n"
+        f"Отправлено: {sent_ok}\n"
+        f"С фото из источника: {sent_from_source}\n"
+        f"С фото с Pexels: {sent_from_pexels}\n"
+        f"Без фото: {sent_text_only}"
+    )
+
+    if sent_ok < MIN_POSTS_TARGET:
+        logging.warning(f"Отправлено меньше минимума ({sent_ok} < {MIN_POSTS_TARGET}) — "
+                        f"возможно, Pollinations или Pexels тормозили.")
 
 
 if __name__ == "__main__":
