@@ -4,9 +4,13 @@ on:
     - cron: '0 */2 * * *'
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   collect:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
 
@@ -15,9 +19,11 @@ jobs:
           python-version: '3.11'
 
       - name: Install deps
-        run: pip install -r requirements.txt
+        run: pip install feedparser requests beautifulsoup4
 
       - name: Run collector
+        env:
+          PEXELS_API_KEY: ${{ secrets.PEXELS_API_KEY }}
         run: python main.py
 
       - name: Save seen.json
