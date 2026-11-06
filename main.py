@@ -1,18 +1,25 @@
-# main.py — финальная версия: фото из источника + Pexels, без Дзена
+# main.py — с фильтром рекламы и автопубликацией в канал для Дзена
 import os, json, logging, random, re
 import feedparser
 import requests
 from bs4 import BeautifulSoup
+from urllib.parse import quote
 
 logging.basicConfig(level=logging.INFO)
 
 # ================= НАСТРОЙКИ =================
 BOT_TOKEN = "9172067181:AAHRPly5-XRdX3ccc7CMSodoek7_RygjuxQ"
 ADMIN_ID = 1470714545
-PEXELS_API_KEY = os.environ.get("PEXELS_API_KEY", "")
 
-MAX_POSTS_PER_RUN = 15        # сколько постов пытаемся отправить
-MIN_POSTS_TARGET = 10         # минимум, который нужен
+# 👇 ПУБЛИЧНЫЙ КАНАЛ, ИЗ КОТОРОГО ДЗЕН БЕРЁТ ПОСТЫ
+# Замените на ваш канал. Бот должен быть админом этого канала!
+PUBLIC_CHANNEL_ID = "@ваш_публичный_канал"
+
+# 👇 КЛЮЧ PEXELS (получить бесплатно на https://www.pexels.com/api/)
+PEXELS_API_KEY = "ВАШ_КЛЮЧ_PEXELS_СЮДА"
+
+# 👇 СКОЛЬКО СТАТЕЙ ЗА ОДИН ЗАПУСК
+MAX_POSTS_PER_RUN = 10
 
 RSS_FEEDS = [
     "https://ria.ru/export/rss2/index.xml",
@@ -25,17 +32,14 @@ RSS_FEEDS = [
 ]
 
 TELEGRAM_CHANNELS = [
-    # Россия
     "mash", "readovkanews", "rian_ru", "bazabazon",
     "ostorozhno_novosti", "shot_shot", "rt_russian", "rbc_news",
     "tass_agency", "kommersant", "yurasumy", "medvedev_telegram",
     "vv_volodin", "novosti_efir", "moscowmap", "toporlive",
     "ecotopor", "davydovin", "skurlatovlive",
-    # Украина
     "truexanewsua", "nikolaevskiy_vanek", "timesofukraine",
     "insiderUKR", "lachen_pyshe", "voynareal", "ukraine_sich",
     "realny_kyiv", "unian_ua", "tsn_ua",
-    # Финансы, нефть и газ
     "centralbank_russia", "alfabank", "bankrollo", "markettwits",
     "igotosochi", "Kot.Finance", "birzhevik_official",
     "birzhevikstocksofficial1", "oilgasofficial1", "papagaz",
@@ -48,7 +52,58 @@ os.makedirs(TEMP_DIR, exist_ok=True)
 # =============================================
 
 
-# ---------- ХРАНИЛИЩЕ «УЖЕ ОТПРАВЛЕНО» ----------
+# ---------- ФИЛЬТР РЕКЛАМЫ ----------
+# Жёсткие маркеры — сразу реклама, без исключений
+AD_HARD = [
+    "промокод", "#реклама", "#промо", "#партнер", "#партнёр",
+    "по вопросам рекламы", "реклама в канале",
+    "казино", "букмекер", "1xbet", "ставки на спорт",
+    "бинарные опционы", "заработок в интернете",
+    "пассивный доход", "финансовая пирамида",
+    "розыгрыш", "выиграй приз",
+]
+
+# Мягкие маркеры — считаем: если их 2+ в тексте, то это реклама
+AD_SOFT = [
+    "подпишись", "подписывайся", "переходи по ссылке", "жми на ссылку",
+    "успей", "только сегодня", "ограниченное предложение",
+    "промо", "акция", "скидка",
+]
+
+
+def is_ad(text: str) -> tuple[bool, str]:
+    """Проверяет, является ли текст рекламой. Возвращает (это_реклама, причина)."""
+    if not text:
+        return False, ""
+    low = text.lower()
+
+    # 1. Жёсткие маркеры
+    for kw in AD_HARD:
+        if kw in low:
+            return True, f"слово '{kw}'"
+
+    # 2. Хэштеги рекламы
+    if re.search(r"#реклам|#промо|#партн", low):
+        return True, "хэштег рекламы"
+
+    # 3. Слишком много ссылок
+    links = re.findall(r"https?://\S+|t\.me/\S+", low)
+    if len(links) >= 3:
+        return True, f"{len(links)} ссылок"
+
+    # 4. Комбинация мягких маркеров
+    soft_hits = [kw for kw in AD_SOFT if kw in low]
+    if len(soft_hits) >= 2:
+        return True, f"рекламные слова: {', '.join(soft_hits[:3])}"
+
+    # 5. Короткий текст со ссылкой (типичный формат рекламной вставки)
+    if len(text) < 200 and links:
+        return True, "короткий текст со ссылкой"
+
+    return False, ""
+
+
+# ---------- БАЗА ----------
 def load_seen():
     if os.path.exists(SEEN_FILE):
         try:
@@ -61,28 +116,21 @@ def load_seen():
 
 def save_seen(seen):
     with open(SEEN_FILE, "w") as f:
-        json.dump(list(seen)[-5000:], f, ensure_ascii=False, indent=2)
+        json.dump(list(seen)[-3000:], f, ensure_ascii=False, indent=2)
 
 
-# ---------- ПЕРЕПИСЫВАНИЕ + КЛЮЧЕВЫЕ СЛОВА ----------
-def rewrite_article(text: str):
-    """Возвращает (заголовок, тело, ключевые_слова_для_фото)."""
+# ---------- ПЕРЕПИСЫВАНИЕ ----------
+def rewrite_with_pollinations(text: str):
     if not text or len(text) < 40:
-        return None, None, None
-
+        return None, None
     prompt = (
         "Ты — редактор новостного канала. Перепиши новость своими словами.\n"
         "- Первое предложение — цепляющий заголовок до 120 символов.\n"
         "- Затем 3–5 коротких абзацев, живой язык, без канцелярита.\n"
+        "- Добавь короткий аналитический комментарий: почему это важно.\n"
         "- Не выдумывай факты.\n\n"
-        "В САМОМ КОНЦЕ ответа добавь отдельную строку строго в формате:\n"
-        "KEYWORDS: word1, word2, word3\n"
-        "(3–5 АНГЛИЙСКИХ слов, описывающих визуальный образ новости. "
-        "Примеры: 'oil refinery, pipeline, gas'; 'bank building, money, finance'; "
-        "'military, tanks, war'; 'president, government, parliament').\n\n"
         f"Новость: {text[:3000]}"
     )
-
     try:
         r = requests.post(
             "https://text.pollinations.ai/openai",
@@ -95,23 +143,16 @@ def rewrite_article(text: str):
         )
         r.raise_for_status()
         full_text = r.json()["choices"][0]["message"]["content"].strip()
-
-        keywords = None
-        if "KEYWORDS:" in full_text:
-            parts = full_text.split("KEYWORDS:")
-            full_text = parts[0].strip()
-            keywords = parts[1].strip().strip("*# ")
-
         lines = full_text.split("\n", 1)
         title = lines[0].strip().strip("*# ")[:120]
         body = lines[1].strip() if len(lines) > 1 else full_text
-        return title, body, keywords
+        return title, body
     except Exception as e:
-        logging.error(f"Pollinations rewrite: {e}")
-        return None, None, None
+        logging.error(f"Pollinations: {e}")
+        return None, None
 
 
-# ---------- ФОТО УРОВЕНЬ 1: ОРИГИНАЛ ИЗ ИСТОЧНИКА ----------
+# ---------- КАРТИНКИ ----------
 def download_image(url, prefix):
     if not url:
         return None
@@ -121,68 +162,101 @@ def download_image(url, prefix):
             ext = r.headers["Content-Type"].split("/")[-1].split(";")[0]
             if ext == "jpeg":
                 ext = "jpg"
-            path = os.path.join(TEMP_DIR, f"{prefix}_src.{ext}")
+            path = os.path.join(TEMP_DIR, f"{prefix}.{ext}")
             with open(path, "wb") as f:
                 f.write(r.content)
             return path
     except Exception as e:
-        logging.warning(f"Download source image: {e}")
+        logging.warning(f"Download image: {e}")
     return None
 
 
-# ---------- ФОТО УРОВЕНЬ 2: PEXELS ----------
-def search_pexels_image(keywords: str, prefix: str):
-    if not PEXELS_API_KEY or not keywords:
+def search_stock_photo(query: str, prefix: str):
+    if not PEXELS_API_KEY or PEXELS_API_KEY == "ВАШ_КЛЮЧ_PEXELS_СЮДА":
         return None
     try:
-        r = requests.get(
-            "https://api.pexels.com/v1/search",
-            headers={"Authorization": PEXELS_API_KEY},
-            params={"query": keywords, "per_page": 3, "orientation": "landscape"},
-            timeout=20,
-        )
-        if r.status_code != 200:
-            logging.warning(f"Pexels HTTP {r.status_code}")
-            return None
-        photos = r.json().get("photos", [])
-        if not photos:
-            return None
-
-        # Пробуем скачать первую подходящую
-        for photo in photos:
-            img_url = photo["src"]["large"]
-            img = requests.get(img_url, timeout=20)
-            if img.status_code == 200:
-                path = os.path.join(TEMP_DIR, f"{prefix}_pexels.jpg")
-                with open(path, "wb") as f:
-                    f.write(img.content)
-                return path
+        headers = {"Authorization": PEXELS_API_KEY}
+        clean_query = re.sub(r"[^\w\s]", "", query)[:100]
+        params = {"query": clean_query, "per_page": 1, "orientation": "landscape"}
+        r = requests.get("https://api.pexels.com/v1/search", headers=headers, params=params, timeout=20)
+        r.raise_for_status()
+        data = r.json()
+        if data.get("photos"):
+            photo_url = data["photos"][0]["src"]["large2x"]
+            return download_image(photo_url, f"{prefix}_stock")
     except Exception as e:
-        logging.warning(f"Pexels search: {e}")
+        logging.warning(f"Pexels search error: {e}")
     return None
 
 
-# ---------- ОТПРАВКА В TELEGRAM ----------
-def send_telegram(text, image_path=None):
+def generate_image(news_context: str, prefix: str):
+    clean = " ".join(news_context.replace("\n", " ").split())[:400]
+    prompt = (
+        f"Photorealistic editorial news photograph illustrating: {clean}. "
+        "Documentary style, natural lighting, realistic environment. "
+        "8k resolution, highly detailed, cinematic. "
+        "NO cartoon, NO illustration, NO abstract shapes, NO plastic skin, "
+        "NO exaggerated anatomy, NO text, NO watermarks."
+    )
+    encoded = quote(prompt)
+    try:
+        url = (
+            f"https://image.pollinations.ai/prompt/{encoded}"
+            f"?width=1280&height=720&model=flux-realism&enhance=true&nologo=true&safe=true"
+        )
+        r = requests.get(url, timeout=120)
+        if r.status_code == 200 and "image" in r.headers.get("Content-Type", ""):
+            path = os.path.join(TEMP_DIR, f"{prefix}_gen.jpg")
+            with open(path, "wb") as f:
+                f.write(r.content)
+            return path
+    except Exception as e:
+        logging.warning(f"Generate image error: {e}")
+    return None
+
+
+def get_best_image(item: dict, body: str):
+    uid_prefix = item["uid"].replace("/", "_")[:30]
+
+    # 1. Оригинал из источника
+    if item.get("image_url"):
+        img = download_image(item["image_url"], f"{uid_prefix}_orig")
+        if img:
+            return img
+
+    # 2. Стоковое фото с Pexels
+    search_query = " ".join(body.split()[:5]) if body else item["text"][:50]
+    img = search_stock_photo(search_query, uid_prefix)
+    if img:
+        return img
+
+    # 3. Генерация
+    return generate_image(body or item["text"], uid_prefix)
+
+
+# ---------- ОТПРАВКА ----------
+def send_telegram(text, image_path=None, chat_id=None, mark_ad=False):
+    """Отправляет сообщение (по умолчанию — админу)."""
+    target = chat_id if chat_id else ADMIN_ID
+    prefix = "🚫 *РЕКЛАМА (не публикую)*\n\n" if mark_ad else ""
+    full_text = prefix + text
     try:
         if image_path and os.path.exists(image_path):
             with open(image_path, "rb") as photo:
-                r = requests.post(
+                requests.post(
                     f"https://api.telegram.org/bot{BOT_TOKEN}/sendPhoto",
-                    data={"chat_id": ADMIN_ID, "caption": text[:1024]},
+                    data={"chat_id": target, "caption": full_text[:1024], "parse_mode": "Markdown"},
                     files={"photo": photo},
                     timeout=30,
                 )
         else:
-            r = requests.post(
+            requests.post(
                 f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage",
-                data={"chat_id": ADMIN_ID, "text": text[:4000], "parse_mode": "Markdown"},
+                data={"chat_id": target, "text": full_text[:4000], "parse_mode": "Markdown"},
                 timeout=30,
             )
-        return r.status_code == 200
     except Exception as e:
         logging.error(f"Telegram send: {e}")
-        return False
 
 
 # ---------- СБОР RSS ----------
@@ -203,7 +277,7 @@ def extract_image_from_rss(entry):
 def fetch_rss(feed_url, seen, posts_batch):
     try:
         feed = feedparser.parse(feed_url)
-        for entry in feed.entries[:5]:
+        for entry in feed.entries[:3]:
             uid = entry.get("id") or entry.get("link")
             if not uid or uid in seen:
                 continue
@@ -232,6 +306,12 @@ def scrape_telegram_channel(channel, limit=3):
             text = text_div.get_text(separator="\n", strip=True) if text_div else ""
             if len(text) < 80:
                 continue
+
+            # Помечаем посты с рекламными метками Telegram (is_ad в самом канале)
+            # Это дополнительный фильтр — если пост помечен в самом Telegram как реклама
+            if msg.find("div", class_="tgme_widget_message_ad"):
+                continue
+
             photos = []
             photo_wrap = msg.find("a", class_="tgme_widget_message_photo_wrap")
             if photo_wrap and photo_wrap.get("style"):
@@ -256,81 +336,63 @@ def main():
     seen = load_seen()
     candidates = []
 
-    # 1. RSS
     for feed_url in RSS_FEEDS:
         fetch_rss(feed_url, seen, candidates)
 
-    # 2. Telegram (перемешиваем каналы и берём побольше)
     channels = TELEGRAM_CHANNELS.copy()
     random.shuffle(channels)
-    for channel in channels[:25]:      # до 25 каналов за запуск
-        candidates.extend(scrape_telegram_channel(channel, limit=3))
+    for channel in channels[:15]:
+        candidates.extend(scrape_telegram_channel(channel, limit=2))
 
     logging.info(f"Кандидатов собрано: {len(candidates)}")
 
-    # Перемешиваем, чтобы источники были разные
     random.shuffle(candidates)
+    batch = candidates[:MAX_POSTS_PER_RUN]
 
-    sent_ok = 0
-    sent_with_photo = 0
-    sent_from_source = 0
-    sent_from_pexels = 0
-    sent_text_only = 0
+    sent = 0
+    ads_skipped = 0
 
-    for item in candidates:
-        if sent_ok >= MAX_POSTS_PER_RUN:
-            break
+    for item in batch:
+        # 🚫 ФИЛЬТР РЕКЛАМЫ — до переписывания, чтобы не тратить токены
+        is_ad_post, reason = is_ad(item["text"])
+        if is_ad_post:
+            logging.info(f"РЕКЛАМА отброшена ({reason}): {item['text'][:60]}...")
+            # Отправляем админу для информации, но НЕ публикуем в канал
+            send_telegram(
+                f"Источник: {item['uid']}\n\n{item['text'][:800]}\n\n_Причина: {reason}_",
+                chat_id=ADMIN_ID,
+                mark_ad=True,
+            )
+            ads_skipped += 1
+            continue
 
-        title, body, keywords = rewrite_article(item["text"])
+        title, body = rewrite_with_pollinations(item["text"])
         if not title:
             continue
 
-        img_path = None
-        photo_source = None
+        # Проверяем переписанный текст тоже (на случай если нейросеть вставила рекламу)
+        is_ad_rewritten, reason2 = is_ad(title + " " + body)
+        if is_ad_rewritten:
+            logging.warning(f"Реклама после рерайта: {reason2}")
+            continue
 
-        # УРОВЕНЬ 1: оригинальное фото
-        if item["image_url"]:
-            img_path = download_image(item["image_url"], item["uid"].replace("/", "_")[:30])
-            if img_path:
-                photo_source = "source"
-                sent_from_source += 1
+        img = get_best_image(item, body)
+        full_post = f"**{title}**\n\n{body}"
 
-        # УРОВЕНЬ 2: Pexels по ключевым словам
-        if not img_path and keywords:
-            img_path = search_pexels_image(keywords, item["uid"].replace("/", "_")[:30])
-            if img_path:
-                photo_source = "pexels"
-                sent_from_pexels += 1
+        # 1. Отправляем АДМИНУ для просмотра
+        send_telegram(full_post, img, chat_id=ADMIN_ID)
 
-        # УРОВЕНЬ 3: только текст (если ничего не нашли)
-        if not img_path:
-            sent_text_only += 1
+        # 2. Публикуем В ПУБЛИЧНЫЙ КАНАЛ → оттуда Дзен заберёт автоматически
+        if PUBLIC_CHANNEL_ID and PUBLIC_CHANNEL_ID != "@ваш_публичный_канал":
+            send_telegram(full_post, img, chat_id=PUBLIC_CHANNEL_ID)
+            logging.info(f"Опубликовано в канал: {title[:50]}")
+        else:
+            logging.warning("PUBLIC_CHANNEL_ID не настроен — пост ушёл только админу.")
 
-        # Отправка
-        ok = send_telegram(f"**{title}**\n\n{body}", img_path)
-        if ok:
-            sent_ok += 1
-            if img_path:
-                sent_with_photo += 1
-            logging.info(f"[{sent_ok}/{MAX_POSTS_PER_RUN}] {photo_source or 'text-only'}: {title[:50]}")
-
-        # Небольшая пауза между отправками, чтобы Telegram не ругался
-        import time
-        time.sleep(1)
+        sent += 1
 
     save_seen(seen)
-
-    logging.info(
-        f"=== ИТОГО ===\n"
-        f"Отправлено: {sent_ok}\n"
-        f"С фото из источника: {sent_from_source}\n"
-        f"С фото с Pexels: {sent_from_pexels}\n"
-        f"Без фото: {sent_text_only}"
-    )
-
-    if sent_ok < MIN_POSTS_TARGET:
-        logging.warning(f"Отправлено меньше минимума ({sent_ok} < {MIN_POSTS_TARGET}) — "
-                        f"возможно, Pollinations или Pexels тормозили.")
+    logging.info(f"Готово. Опубликовано: {sent}. Рекламы отфильтровано: {ads_skipped}")
 
 
 if __name__ == "__main__":
