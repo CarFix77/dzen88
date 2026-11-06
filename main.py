@@ -1,20 +1,17 @@
-# main.py — поиск реальных фото в Openverse и Wikimedia Commons (без ключей) + Pollinations
-import os, json, logging, random, re, time
+# main.py — с усиленным фильтром рекламы, переводом и отправкой в канал
+import os, json, logging, random, re
 import feedparser
 import requests
 from bs4 import BeautifulSoup
 from urllib.parse import quote
+from deep_translator import GoogleTranslator # 👈 Добавлен импорт для перевода
 
 logging.basicConfig(level=logging.INFO)
 
 # ================= НАСТРОЙКИ =================
 BOT_TOKEN = "9172067181:AAHRPly5-XRdX3ccc7CMSodoek7_RygjuxQ"
 ADMIN_ID = 1470714545
-
-# 👇 ПУБЛИЧНЫЙ КАНАЛ, ИЗ КОТОРОГО ДЗЕН БЕРЁТ ПОСТЫ
-PUBLIC_CHANNEL_ID = "@ваш_публичный_канал"
-
-# 👇 БОЛЬШЕ НЕ НУЖНЫ КЛЮЧИ PEXELS И HUGGING FACE!
+PUBLIC_CHANNEL_ID = "@ваш_публичный_канал" # 👈 Убедитесь, что бот админ в канале!
 
 MAX_POSTS_PER_RUN = 10
 
@@ -41,6 +38,7 @@ TELEGRAM_CHANNELS = [
     "igotosochi", "Kot.Finance", "birzhevik_official",
     "birzhevikstocksofficial1", "oilgasofficial1", "papagaz",
     "neftegazchannel", "oil_capital", "lngchannel", "OilGasGame",
+    "woth_the_world", # 👈 Добавлен англоязычный канал (будет переведен)
 ]
 
 SEEN_FILE = "seen.json"
@@ -48,146 +46,102 @@ TEMP_DIR = "temp"
 os.makedirs(TEMP_DIR, exist_ok=True)
 # =============================================
 
-# ... (функции load_seen, save_seen, rewrite_with_pollinations, download_image,
-# send_telegram, extract_image_from_rss, fetch_rss, scrape_telegram_channel —
-# остаются без изменений, вставьте их из предыдущего рабочего кода) ...
+# ... (функции load_seen, save_seen, download_image, search_stock_photo,
+# generate_image, get_best_image, send_telegram, extract_image_from_rss,
+# fetch_rss — остаются без изменений) ...
 
-# ---------- ПОИСК В OPENVERSE (БЕЗ КЛЮЧА) ----------
-def search_openverse(query: str, prefix: str):
-    """Ищет реальное фото в Openverse. Без регистрации, лимит ~1 запрос/сек."""
+# ---------- УСИЛЕННЫЙ ФИЛЬТР РЕКЛАМЫ ----------
+AD_HARD = [
+    "промокод", "#реклама", "#advertisement", "erid:", "реклама в канале",
+    "казино", "букмекер", "1xbet", "ставки на спорт",
+    "бинарные опционы", "заработок в интернете", "пассивный доход",
+    "финансовая пирамида", "розыгрыш", "выиграй приз",
+    "биржевик", "биржевик | акции", "oilgasofficial", # 👈 Явные названия рекламных каналов
+]
+
+AD_SOFT = [
+    "подпишись", "подписывайся", "переходи по ссылке", "жми на ссылку",
+    "успей", "только сегодня", "ограниченное предложение",
+    "промо", "акция", "скидка",
+]
+
+def is_ad(text: str) -> tuple[bool, str]:
+    if not text:
+        return False, ""
+    low = text.lower()
+
+    for kw in AD_HARD:
+        if kw in low:
+            return True, f"слово '{kw}'"
+
+    if re.search(r"#реклам|#advertis|erid:", low):
+        return True, "рекламный хэштег/маркер"
+
+    links = re.findall(r"https?://\S+|t\.me/\S+", low)
+    if len(links) >= 3:
+        return True, f"{len(links)} ссылок"
+
+    soft_hits = [kw for kw in AD_SOFT if kw in low]
+    if len(soft_hits) >= 2:
+        return True, f"рекламные слова: {', '.join(soft_hits[:3])}"
+
+    if len(text) < 200 and links:
+        return True, "короткий текст со ссылкой"
+
+    return False, ""
+
+
+# ---------- ПЕРЕВОД ТЕКСТА ----------
+def translate_to_russian(text: str) -> str:
+    """Переводит текст на русский, если он на другом языке."""
+    if not text or len(text.strip()) < 20:
+        return text
     try:
-        # Очищаем запрос
-        clean_query = re.sub(r"[^\w\s]", "", query)[:100]
-        # Openverse API (анонимный доступ)
-        params = {
-            "q": clean_query,
-            "license": "cc0,pdm,by,by-sa", # Свободные лицензии
-            "page_size": 1,
-        }
-        r = requests.get(
-            "https://api.openverse.org/v1/images/",
-            params=params,
-            timeout=20,
-            headers={"User-Agent": "NewsBot/1.0 (contact: admin@example.com)"} # Вежливый User-Agent
-        )
-        r.raise_for_status()
-        data = r.json()
-        if data.get("results"):
-            img_url = data["results"][0].get("url")
-            if img_url:
-                logging.info(f"Openverse: найдено фото по запросу '{clean_query}'")
-                return download_image(img_url, f"{prefix}_openverse")
+        # Определяем язык и переводим, если это не русский
+        # GoogleTranslator сам определит исходный язык
+        translated = GoogleTranslator(source='auto', target='ru').translate(text)
+        logging.info("Текст переведен на русский.")
+        return translated
     except Exception as e:
-        logging.warning(f"Openverse search error: {e}")
-    return None
+        logging.warning(f"Ошибка перевода: {e}. Оставляем исходный текст.")
+        return text
 
 
-# ---------- ПОИСК В WIKIMEDIA COMMONS (БЕЗ КЛЮЧА) ----------
-def search_wikimedia(query: str, prefix: str):
-    """Ищет реальное фото в Wikimedia Commons. Без регистрации, без ключа."""
-    try:
-        clean_query = re.sub(r"[^\w\s]", "", query)[:100]
-        # MediaWiki API для поиска файлов
-        params = {
-            "action": "query",
-            "format": "json",
-            "generator": "search",
-            "gsrsearch": f"{clean_query} filetype:bitmap",
-            "gsrnamespace": 6, # Пространство имён "Файл"
-            "gsrlimit": 1,
-            "prop": "imageinfo",
-            "iiprop": "url",
-        }
-        r = requests.get(
-            "https://commons.wikimedia.org/w/api.php",
-            params=params,
-            timeout=20,
-            headers={"User-Agent": "NewsBot/1.0 (contact: admin@example.com)"}
-        )
-        r.raise_for_status()
-        data = r.json()
-        pages = data.get("query", {}).get("pages", {})
-        for page in pages.values():
-            imageinfo = page.get("imageinfo", [])
-            if imageinfo:
-                img_url = imageinfo[0].get("url")
-                if img_url:
-                    logging.info(f"Wikimedia: найдено фото по запросу '{clean_query}'")
-                    return download_image(img_url, f"{prefix}_wikimedia")
-    except Exception as e:
-        logging.warning(f"Wikimedia search error: {e}")
-    return None
+# ---------- ПЕРЕПИСЫВАНИЕ (С ПЕРЕВОДОМ) ----------
+def rewrite_with_pollinations(text: str):
+    if not text or len(text) < 40:
+        return None, None
 
+    # 👇 ПЕРЕВОДИМ ТЕКСТ ПЕРЕД ОТПРАВКОЙ В НЕЙРОСЕТЬ
+    text_ru = translate_to_russian(text)
 
-# ---------- ГЕНЕРАЦИЯ (РЕЗЕРВНЫЙ ВАРИАНТ) ----------
-def generate_via_pollinations(news_context: str, prefix: str):
-    """Генерация через Pollinations (если реальные фото не найдены)."""
-    clean = " ".join(news_context.replace("\n", " ").split())[:400]
     prompt = (
-        f"Photorealistic editorial news photograph illustrating: {clean}. "
-        "Documentary style, natural lighting, realistic environment. "
-        "8k resolution, highly detailed, cinematic. "
-        "NO cartoon, NO illustration, NO abstract shapes, NO plastic skin, "
-        "NO exaggerated anatomy, NO text, NO watermarks."
-    )
-    encoded = quote(prompt)
-    url = (
-        f"https://image.pollinations.ai/prompt/{encoded}"
-        f"?width=1280&height=720&model=flux-realism&enhance=true&nologo=true&safe=true"
+        "Ты — редактор новостного канала. Перепиши новость своими словами.\n"
+        "- Первое предложение — цепляющий заголовок до 120 символов.\n"
+        "- Затем 3–5 коротких абзацев, живой язык, без канцелярита.\n"
+        "- Добавь короткий аналитический комментарий: почему это важно.\n"
+        "- Не выдумывай факты.\n\n"
+        f"Новость: {text_ru[:3000]}"
     )
     try:
-        r = requests.get(url, timeout=120)
-        if r.status_code == 200 and "image" in r.headers.get("Content-Type", ""):
-            path = os.path.join(TEMP_DIR, f"{prefix}_pollinations.jpg")
-            with open(path, "wb") as f:
-                f.write(r.content)
-            logging.info("Изображение сгенерировано через Pollinations.")
-            return path
+        r = requests.post(
+            "https://text.pollinations.ai/openai",
+            json={"model": "openai", "messages": [{"role": "user", "content": prompt}], "temperature": 0.7},
+            timeout=120,
+        )
+        r.raise_for_status()
+        full_text = r.json()["choices"][0]["message"]["content"].strip()
+        lines = full_text.split("\n", 1)
+        title = lines[0].strip().strip("*# ")[:120]
+        body = lines[1].strip() if len(lines) > 1 else full_text
+        return title, body
     except Exception as e:
-        logging.warning(f"Pollinations generation error: {e}")
-    return None
+        logging.error(f"Pollinations: {e}")
+        return None, None
 
 
-# ---------- КАСКАДНЫЙ ВЫБОР ИЗОБРАЖЕНИЯ ----------
-def get_best_image(item: dict, body: str):
-    """
-    Каскадный поиск картинки:
-    1. Оригинал из источника (RSS/Telegram)
-    2. Openverse (реальные фото, без ключа)
-    3. Wikimedia Commons (реальные фото, без ключа)
-    4. Pollinations (генерация)
-    """
-    uid_prefix = item["uid"].replace("/", "_")[:30]
+# ... (остальные функции и main() остаются без изменений, кроме вызова send_telegram в канал) ...
 
-    # 1. Оригинал
-    if item.get("image_url"):
-        img = download_image(item["image_url"], f"{uid_prefix}_orig")
-        if img:
-            logging.info("Использовано оригинальное фото из источника.")
-            return img
-
-    # Ключевые слова для поиска (первые 8 слов из тела)
-    search_query = " ".join(body.split()[:8]) if body else item["text"][:80]
-
-    # 2. Openverse
-    logging.info(f"Ищем реальное фото в Openverse: '{search_query}'")
-    img = search_openverse(search_query, uid_prefix)
-    if img:
-        return img
-    time.sleep(1) # Лимит Openverse — 1 запрос/сек
-
-    # 3. Wikimedia Commons
-    logging.info(f"Ищем реальное фото в Wikimedia: '{search_query}'")
-    img = search_wikimedia(search_query, uid_prefix)
-    if img:
-        return img
-
-    # 4. Генерация (последний резерв)
-    logging.info("Реальные фото не найдены, генерируем через Pollinations...")
-    return generate_via_pollinations(body or item["text"], uid_prefix)
-
-
-# ---------- ГЛАВНАЯ ЛОГИКА (без изменений) ----------
 def main():
     seen = load_seen()
     candidates = []
@@ -206,27 +160,48 @@ def main():
     batch = candidates[:MAX_POSTS_PER_RUN]
 
     sent = 0
+    ads_skipped = 0
 
     for item in batch:
-        title, body = rewrite_with_pollinations(item["text"])
+        is_ad_post, reason = is_ad(item["text"])
+        if is_ad_post:
+            logging.info(f"РЕКЛАМА отброшена ({reason}): {item['text'][:60]}...")
+            send_telegram(
+                f"Источник: {item['uid']}\n\n{item['text'][:800]}\n\n_Причина: {reason}_",
+                chat_id=ADMIN_ID, mark_ad=True,
+            )
+            ads_skipped += 1
+            continue
+
+        title, body = rewrite_with_pollinations(item["text"]) # Перевод происходит внутри
         if not title:
             continue
 
-        img = get_best_image(item, body) # 👈 Новая каскадная функция
+        is_ad_rewritten, reason2 = is_ad(title + " " + body)
+        if is_ad_rewritten:
+            logging.warning(f"Реклама после рерайта: {reason2}")
+            continue
+
+        img = get_best_image(item, body)
         full_post = f"**{title}**\n\n{body}"
 
+        # Отправка админу
         send_telegram(full_post, img, chat_id=ADMIN_ID)
 
+        # Отправка в публичный канал (для Дзена)
         if PUBLIC_CHANNEL_ID and PUBLIC_CHANNEL_ID != "@ваш_публичный_канал":
-            send_telegram(full_post, img, chat_id=PUBLIC_CHANNEL_ID)
-            logging.info(f"Опубликовано в канал: {title[:50]}")
+            success = send_telegram(full_post, img, chat_id=PUBLIC_CHANNEL_ID)
+            if success:
+                logging.info(f"Опубликовано в канал: {title[:50]}")
+            else:
+                logging.error(f"НЕ УДАЛОСЬ опубликовать в канал. Проверьте права бота!")
         else:
             logging.warning("PUBLIC_CHANNEL_ID не настроен — пост ушёл только админу.")
 
         sent += 1
 
     save_seen(seen)
-    logging.info(f"Готово. Опубликовано: {sent}")
+    logging.info(f"Готово. Опубликовано: {sent}. Рекламы отфильтровано: {ads_skipped}")
 
 if __name__ == "__main__":
     main()
